@@ -1,4 +1,31 @@
-import type { DailyUsage, PeriodUsage, SourceUsage } from "./types.js";
+import type {
+  DailyUsage,
+  PeriodUsage,
+  SourceUsage,
+  UsageRecord,
+} from "./types.js";
+
+/** Sum per-message records into one day-keyed series, sorted by date. */
+export function foldDaily(records: UsageRecord[]): DailyUsage[] {
+  const byDate = new Map<string, DailyUsage>();
+  for (const r of records) {
+    const day =
+      byDate.get(r.date) ??
+      {
+        date: r.date,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+      };
+    day.inputTokens += r.inputTokens;
+    day.outputTokens += r.outputTokens;
+    day.cacheReadTokens += r.cacheReadTokens;
+    day.cacheCreationTokens += r.cacheCreationTokens;
+    byDate.set(r.date, day);
+  }
+  return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
+}
 
 /** Merge multiple sources' daily usage into one series, summed by date. */
 export function mergeDaily(sources: SourceUsage[]): DailyUsage[] {

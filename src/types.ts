@@ -12,6 +12,24 @@ export interface DailyUsage {
   cacheCreationTokens: number;
 }
 
+/**
+ * One assistant response's usage, with the dimensions the insights report
+ * slices on (project, model, session, time of day). `readXxxUsage` folds these
+ * into DailyUsage; the insights report keeps them.
+ */
+export interface UsageRecord {
+  source: AgentSource;
+  timestamp: string; // ISO-8601, as written by the agent
+  date: string; // YYYY-MM-DD (local timezone)
+  project: string; // Claude: project dir name; Codex: session cwd
+  model: string;
+  sessionId: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+}
+
 /** A bucket aggregated by week or month. */
 export interface PeriodUsage {
   key: string; // e.g. "2025-W23" or "2025-06"
