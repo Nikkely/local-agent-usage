@@ -2,13 +2,15 @@
 import { writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { readClaudeUsage } from "./claude.js";
-import { readCodexUsage } from "./codex.js";
+import { readClaudeRecords } from "./claude.js";
+import { readCodexRecords } from "./codex.js";
+import { foldDaily } from "./aggregate.js";
+import { computeInsights, renderInsights } from "./insights.js";
 import { renderHtml } from "./report.js";
 import { openInBrowser } from "./open.js";
 import { parseMonth } from "./month.js";
 import { localDate } from "./dates.js";
-import type { AgentSource, SourceUsage } from "./types.js";
+import type { AgentSource, SourceUsage, UsageRecord } from "./types.js";
 
 interface Cli {
   days: number;
@@ -18,6 +20,8 @@ interface Cli {
   open: boolean;
   tui: boolean;
   source: "claude" | "codex" | "all";
+  insights: boolean;
+  json: boolean;
   help: boolean;
 }
 
@@ -33,6 +37,10 @@ Options:
   --days <n>        Look back a fixed number of days (overrides the default)
   --month <YYYY-MM> Show a single calendar month (e.g. 2026-06); excludes --days
   --source <src>    Agent logs to read: "claude", "codex", or "all" (default: all)
+  --insights        Print a text trend analysis to stdout instead of the HTML
+                    report (monthly/weekly trend, projects, models, hour of day,
+                    weekday, session-size concentration)
+  --json            With --insights, emit the raw breakdown as JSON
   --tui             Open an interactive terminal dashboard instead of HTML
   --output <path>   Output HTML file (default: local-agent-usage.html)
   --open <bool>     Auto-open the report in a browser (default: true)
@@ -47,6 +55,8 @@ Examples:
   npx local-agent-usage
   npx local-agent-usage --days 90
   npx local-agent-usage --month 2026-06
+  npx local-agent-usage --insights
+  npx local-agent-usage --insights --days 90 --source claude
   npx local-agent-usage --tui
   npx local-agent-usage --source codex --output codex.html --open false
 
@@ -63,6 +73,8 @@ function parseArgs(argv: string[]): Cli {
     open: true,
     tui: false,
     source: "all",
+    insights: false,
+    json: false,
     help: false,
   };
 
@@ -84,6 +96,12 @@ function parseArgs(argv: string[]): Cli {
       }
       case "--tui":
         cli.tui = true;
+        break;
+      case "--insights":
+        cli.insights = true;
+        break;
+      case "--json":
+        cli.json = true;
         break;
       case "--output":
       case "-o": {
@@ -183,24 +201,54 @@ async function main(): Promise<void> {
   const wanted: AgentSource[] =
     cli.source === "all" ? ["claude", "codex"] : [cli.source];
 
-  const readers = { claude: readClaudeUsage, codex: readCodexUsage } as const;
+  // One reader set for both outputs: the HTML report folds records into daily
+  // totals, and keeps the records for the insight panels.
+  const recordReaders = {
+    claude: readClaudeRecords,
+    codex: readCodexRecords,
+  } as const;
+
+  // Text trend analysis, printed instead of writing the HTML report.
+  if (cli.insights) {
+    const records: UsageRecord[] = [];
+    for (const s of wanted) {
+      console.error(`Reading local ${s} logs for ${periodLabel}...`);
+      records.push(
+        ...(await recordReaders[s]({
+          since: start,
+          until,
+          throwIfEmpty: wanted.length === 1,
+        }))
+      );
+    }
+    const insights = computeInsights(records);
+    process.stdout.write(
+      cli.json
+        ? JSON.stringify(insights, null, 2) + "\n"
+        : renderInsights(insights) + "\n"
+    );
+    return;
+  }
+
   const sources: SourceUsage[] = [];
+  const allRecords: UsageRecord[] = [];
   for (const s of wanted) {
     console.error(`Reading local ${s} logs for ${periodLabel}...`);
     // With multiple sources, a missing one warns and is skipped instead of aborting.
-    const daily = await readers[s]({
+    const records = await recordReaders[s]({
       since: start,
       until,
       throwIfEmpty: wanted.length === 1,
     });
-    sources.push({ source: s, daily });
+    allRecords.push(...records);
+    sources.push({ source: s, daily: foldDaily(records) });
   }
 
   if (sources.every((s) => s.daily.length === 0)) {
     console.error("No usage data found for this period.");
   }
 
-  const html = renderHtml(sources);
+  const html = renderHtml(sources, allRecords);
   const outPath = resolve(process.cwd(), cli.output);
   await writeFile(outPath, html, "utf8");
   console.error(`Wrote report: ${outPath}`);

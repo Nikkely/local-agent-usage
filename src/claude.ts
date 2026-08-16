@@ -1,8 +1,9 @@
 import { readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
 import { localDate } from "./dates.js";
-import type { DailyUsage, ReadOptions } from "./types.js";
+import { foldDaily } from "./aggregate.js";
+import type { DailyUsage, ReadOptions, UsageRecord } from "./types.js";
 
 /**
  * Read Claude Code usage straight from local session logs — no API key needed.
@@ -15,8 +16,11 @@ interface AssistantLine {
   type?: string;
   timestamp?: string;
   requestId?: string;
+  sessionId?: string;
+  cwd?: string;
   message?: {
     id?: string;
+    model?: string;
     usage?: {
       input_tokens?: number;
       output_tokens?: number;
@@ -46,7 +50,13 @@ async function findJsonl(dir: string): Promise<string[]> {
   return out;
 }
 
-export async function readClaudeUsage(opts: ReadOptions): Promise<DailyUsage[]> {
+/**
+ * Per-message usage records, keeping the project/model/session dimensions that
+ * `readClaudeUsage` folds away. Same parsing and dedupe rules.
+ */
+export async function readClaudeRecords(
+  opts: ReadOptions
+): Promise<UsageRecord[]> {
   const throwIfEmpty = opts.throwIfEmpty ?? true;
   const root = projectsDir();
   const files = await findJsonl(root);
@@ -64,9 +74,13 @@ export async function readClaudeUsage(opts: ReadOptions): Promise<DailyUsage[]> 
   const sinceMs = opts.since.getTime();
   const untilMs = opts.until?.getTime() ?? Infinity;
   const seen = new Set<string>();
-  const byDate = new Map<string, DailyUsage>();
+  const records: UsageRecord[] = [];
 
   for (const file of files) {
+    // Fallback project id: ~/.claude/projects/<encoded-cwd>/<session>.jsonl.
+    // The encoding is lossy (slashes and dots both become "-"), so prefer each
+    // line's own `cwd` — that also lets Claude and Codex projects line up.
+    const dirName = relative(root, file).split(sep)[0] ?? "(unknown)";
     let content: string;
     try {
       content = await readFile(file, "utf8");
@@ -91,26 +105,26 @@ export async function readClaudeUsage(opts: ReadOptions): Promise<DailyUsage[]> 
       if (dedupeKey !== ":" && seen.has(dedupeKey)) continue;
       seen.add(dedupeKey);
 
-      const date = localDate(o.timestamp);
-      const day =
-        byDate.get(date) ??
-        {
-          date,
-          inputTokens: 0,
-          outputTokens: 0,
-          cacheReadTokens: 0,
-          cacheCreationTokens: 0,
-        };
-
       const u = o.message.usage;
-      day.inputTokens += u.input_tokens ?? 0;
-      day.outputTokens += u.output_tokens ?? 0;
-      day.cacheReadTokens += u.cache_read_input_tokens ?? 0;
-      day.cacheCreationTokens += u.cache_creation_input_tokens ?? 0;
-
-      byDate.set(date, day);
+      records.push({
+        source: "claude",
+        timestamp: o.timestamp,
+        date: localDate(o.timestamp),
+        project: o.cwd ?? dirName,
+        model: o.message.model ?? "(unknown)",
+        // Sessions without an id are per-file anyway, so the path stands in.
+        sessionId: o.sessionId ?? file,
+        inputTokens: u.input_tokens ?? 0,
+        outputTokens: u.output_tokens ?? 0,
+        cacheReadTokens: u.cache_read_input_tokens ?? 0,
+        cacheCreationTokens: u.cache_creation_input_tokens ?? 0,
+      });
     }
   }
 
-  return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
+  return records;
+}
+
+export async function readClaudeUsage(opts: ReadOptions): Promise<DailyUsage[]> {
+  return foldDaily(await readClaudeRecords(opts));
 }

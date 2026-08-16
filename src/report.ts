@@ -1,10 +1,15 @@
-import type { DailyUsage, PeriodUsage, SourceUsage } from "./types.js";
+import type {
+  DailyUsage,
+  PeriodUsage,
+  SourceUsage,
+  UsageRecord,
+} from "./types.js";
+import { computeCharts } from "./insights.js";
 import { fmtTokens, fmtUsd } from "./fmt.js";
 import {
   RATES,
   aggregateMonthly,
   aggregateWeekly,
-  estimateCost,
   mergeDaily,
   summarize,
   type Summary,
@@ -41,14 +46,56 @@ function sumTokens(daily: DailyUsage[]): number {
   return daily.reduce((n, d) => n + dailyTotal(d), 0);
 }
 
-export function renderHtml(sources: SourceUsage[]): string {
+/**
+ * @param records Optional per-message records. When present, the report gains
+ * the insight panels (model migration, projects, when-you-work, session
+ * concentration, efficiency) that day-level totals cannot answer.
+ */
+/**
+ * The insight half of the report: the same slices the `--insights` text report
+ * tables, drawn so the trend is visible. Deliberately no written takeaways —
+ * any interpretation baked in here goes stale as soon as the data moves, so
+ * reading the charts is left to whoever (or whatever) is looking at them.
+ */
+const INSIGHT_PANELS = `
+  <div class="section-title">Insights — how the usage is changing</div>
+
+  <div class="panel">
+    <h2>Model mix by week <span style="color:var(--muted);font-weight:normal">— share of tokens</span></h2>
+    <div class="chart-wrap" style="height:320px"><canvas id="modelMix"></canvas></div>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>Where the tokens go <span style="color:var(--muted);font-weight:normal">— by project (cwd)</span></h2>
+      <div class="chart-wrap" style="height:360px"><canvas id="projects"></canvas></div>
+    </div>
+    <div class="panel">
+      <h2>Session concentration <span style="color:var(--muted);font-weight:normal">— cumulative share of tokens by session size</span></h2>
+      <div class="chart-wrap" style="height:360px"><canvas id="lorenz"></canvas></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Efficiency by week <span style="color:var(--muted);font-weight:normal">— tokens per active day vs $/MTok vs cache read share</span></h2>
+    <div class="chart-wrap" style="height:320px"><canvas id="efficiency"></canvas></div>
+  </div>
+
+  <div class="panel">
+    <h2>When you work <span style="color:var(--muted);font-weight:normal">— tokens by weekday × hour (local)</span></h2>
+    <div id="heat" class="heat"></div>
+  </div>
+`;
+
+export function renderHtml(
+  sources: SourceUsage[],
+  records: UsageRecord[] = []
+): string {
   const daily = mergeDaily(sources);
   const data = buildData(daily);
   const s = data.summary;
 
   const monthlyCumulative = withMonthlyCumulative(data.daily);
-
-  const peakCost = s.peakDay ? estimateCost(s.peakDay) : 0;
 
   // Only show the per-agent split when more than one source is present.
   const multiSource = sources.filter((x) => x.daily.length > 0).length > 1;
@@ -57,15 +104,11 @@ export function renderHtml(sources: SourceUsage[]): string {
     total: sumTokens(x.daily),
     daily: x.daily,
   }));
-  const splitMeta = multiSource
-    ? sourceSplit
-        .filter((x) => x.total > 0)
-        .map((x) => `${x.source} ${fmtTokens(x.total)}`)
-        .join(" · ")
-    : "";
+  const charts = records.length > 0 ? computeCharts(records) : null;
 
   // Everything the client charts needs, serialized once.
   const payload = JSON.stringify({
+    charts,
     daily: data.daily,
     weekly: data.weekly,
     monthly: data.monthly,
@@ -103,22 +146,6 @@ export function renderHtml(sources: SourceUsage[]): string {
   h1 { font-size: 20px; margin: 0 0 4px; letter-spacing: 0.5px; }
   h1 .accent { color: var(--accent); }
   .sub { color: var(--muted); font-size: 13px; margin-bottom: 28px; }
-  .cards {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-    gap: 16px;
-    margin-bottom: 32px;
-  }
-  .card {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 18px;
-  }
-  .card .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
-  .card .v { font-size: 26px; margin-top: 8px; color: var(--accent); }
-  .card .v.alt { color: var(--accent2); }
-  .card .meta { color: var(--muted); font-size: 12px; margin-top: 6px; }
   .grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -149,6 +176,14 @@ export function renderHtml(sources: SourceUsage[]): string {
   }
   .toggle button.active { color: var(--bg); background: var(--accent); border-color: var(--accent); }
   .chart-wrap { position: relative; height: 300px; }
+  .section-title {
+    font-size: 13px; color: var(--muted); letter-spacing: 2px;
+    text-transform: uppercase; margin: 34px 2px 14px;
+    border-top: 1px solid var(--border); padding-top: 18px;
+  }
+  .heat { display: grid; grid-template-columns: 34px repeat(24, 1fr); gap: 2px; }
+  .heat div { font-size: 10px; color: var(--muted); text-align: center; }
+  .heat .cell { border-radius: 2px; height: 18px; }
   footer { color: var(--muted); font-size: 11px; margin-top: 24px; text-align: center; }
 </style>
 </head>
@@ -157,46 +192,6 @@ export function renderHtml(sources: SourceUsage[]): string {
   <div class="sub">
     ${s.rangeStart || "—"} → ${s.rangeEnd || "—"} &nbsp;·&nbsp;
     rates: input ${fmtUsd(RATES.input)}/MTok, output ${fmtUsd(RATES.output)}/MTok (Sonnet 4.6 est., applied to all agents)
-  </div>
-
-  <div class="cards">
-    <div class="card">
-      <div class="k">Total Tokens</div>
-      <div class="v">${fmtTokens(s.totalTokens)}</div>
-      <div class="meta">in ${fmtTokens(s.totalInput)} · out ${fmtTokens(
-    s.totalOutput
-  )}${splitMeta ? `<br>${splitMeta}` : ""}</div>
-    </div>
-    <div class="card">
-      <div class="k">Cache Tokens</div>
-      <div class="v alt">${fmtTokens(
-        s.totalCacheRead + s.totalCacheCreation
-      )}</div>
-      <div class="meta">read ${fmtTokens(s.totalCacheRead)} · write ${fmtTokens(
-    s.totalCacheCreation
-  )}</div>
-    </div>
-    <div class="card">
-      <div class="k">Estimated Cost</div>
-      <div class="v">${fmtUsd(s.totalCost)}</div>
-      <div class="meta">includes cache pricing</div>
-    </div>
-    <div class="card">
-      <div class="k">Peak Day</div>
-      <div class="v alt">${s.peakDay ? s.peakDay.date : "—"}</div>
-      <div class="meta">${
-        s.peakDay
-          ? fmtTokens(
-              s.peakDay.inputTokens +
-                s.peakDay.outputTokens +
-                s.peakDay.cacheReadTokens +
-                s.peakDay.cacheCreationTokens
-            ) +
-            " tok · " +
-            fmtUsd(peakCost)
-          : "no data"
-      }</div>
-    </div>
   </div>
 
   <div class="grid">
@@ -226,6 +221,8 @@ export function renderHtml(sources: SourceUsage[]): string {
     <h2>Daily Detail (Input / Output / Cache)</h2>
     <div class="chart-wrap" style="height:340px"><canvas id="daily"></canvas></div>
   </div>
+
+  ${charts ? INSIGHT_PANELS : ""}
 
   <footer>Generated by local-agent-usage · cost figures are estimates only</footer>
 
@@ -370,6 +367,177 @@ if (cumEl) {
       plugins: { legend: { display: false } },
     },
   });
+}
+
+// --- Insight charts -------------------------------------------------------
+if (DATA.charts) {
+  const K = DATA.charts;
+  const PALETTE = ["#c97fff","#6ee7ff","#ffb86c","#50fa7b","#ff79c6","#8be9fd","#f1fa8c","#bd93f9","#5a5a72"];
+  const pctTick = (v) => Math.round(v * 100) + "%";
+
+  // Model mix: shares per week, so migrations read regardless of volume swings.
+  const weekTotals = K.modelByWeek.weeks.map((_, i) =>
+    K.modelByWeek.models.reduce((a, m) => a + m.tokens[i], 0)
+  );
+  new Chart(document.getElementById("modelMix"), {
+    type: "bar",
+    data: {
+      labels: K.modelByWeek.weeks,
+      datasets: K.modelByWeek.models.map((m, i) => ({
+        label: m.name,
+        data: m.tokens.map((v, j) => (weekTotals[j] ? v / weekTotals[j] : 0)),
+        backgroundColor: PALETTE[i % PALETTE.length],
+        rawTokens: m.tokens,
+      })),
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: { stacked: true, grid: { display: false } },
+        y: { stacked: true, max: 1, ticks: { callback: pctTick } },
+      },
+      plugins: {
+        legend: { labels: { boxWidth: 12 } },
+        tooltip: {
+          callbacks: {
+            label: (c) =>
+              c.dataset.label + ": " + Math.round(c.parsed.y * 100) + "% (" +
+              fmtTok(c.dataset.rawTokens[c.dataIndex]) + ")",
+          },
+        },
+      },
+    },
+  });
+
+  new Chart(document.getElementById("projects"), {
+    type: "bar",
+    data: {
+      labels: K.topProjects.map((p) => p.name),
+      datasets: [{
+        label: "tokens",
+        data: K.topProjects.map((p) => p.tokens),
+        // Highlight the throwaway/ephemeral paths — they are the ones whose
+        // context never gets reused across sessions.
+        backgroundColor: K.topProjects.map((p) =>
+          ["worktrees", "private/var/folders", "/tmp/", "more)"].some((x) => p.name.indexOf(x) >= 0)
+            ? C.OUTPUT_COLOR
+            : C.ACCENT
+        ),
+      }],
+    },
+    options: {
+      indexAxis: "y",
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: { x: { ticks: { callback: fmtTok } }, y: { grid: { display: false } } },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: (c) => fmtTok(c.parsed.x) + "  ($" + K.topProjects[c.dataIndex].cost.toFixed(0) + ")",
+          },
+        },
+      },
+    },
+  });
+
+  // Lorenz curve vs the diagonal: the gap IS the concentration.
+  new Chart(document.getElementById("lorenz"), {
+    type: "line",
+    data: {
+      datasets: [
+        {
+          label: "sessions -> tokens",
+          data: K.lorenz,
+          borderColor: C.ACCENT,
+          backgroundColor: "rgba(201,127,255,0.15)",
+          fill: true,
+          pointRadius: 0,
+          tension: 0.1,
+        },
+        {
+          label: "perfectly even",
+          data: [{ x: 0, y: 0 }, { x: 1, y: 1 }],
+          borderColor: "#5a5a72",
+          borderDash: [4, 4],
+          pointRadius: 0,
+          fill: false,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      parsing: false,
+      scales: {
+        x: { type: "linear", min: 0, max: 1, ticks: { callback: pctTick }, title: { display: true, text: "sessions (smallest -> largest)" } },
+        y: { min: 0, max: 1, ticks: { callback: pctTick }, title: { display: true, text: "share of tokens" } },
+      },
+      plugins: { legend: { labels: { boxWidth: 12 } } },
+    },
+  });
+
+  new Chart(document.getElementById("efficiency"), {
+    type: "bar",
+    data: {
+      labels: K.efficiencyByWeek.map((w) => w.week),
+      datasets: [
+        {
+          label: "tokens / active day",
+          data: K.efficiencyByWeek.map((w) => w.tokensPerDay),
+          backgroundColor: C.ACCENT,
+          yAxisID: "y",
+        },
+        {
+          type: "line",
+          label: "$ / MTok",
+          data: K.efficiencyByWeek.map((w) => w.costPerMTok),
+          borderColor: C.OUTPUT_COLOR,
+          pointRadius: 2,
+          tension: 0.25,
+          yAxisID: "y1",
+        },
+        {
+          type: "line",
+          label: "cache read share",
+          data: K.efficiencyByWeek.map((w) => w.cacheShare),
+          borderColor: C.CACHE_COLOR,
+          borderDash: [4, 4],
+          pointRadius: 0,
+          tension: 0.25,
+          yAxisID: "y2",
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: { grid: { display: false } },
+        y: { position: "left", ticks: { callback: fmtTok } },
+        y1: { position: "right", grid: { display: false }, ticks: { callback: (v) => "$" + v.toFixed(2) } },
+        y2: { display: false, min: 0, max: 1 },
+      },
+      plugins: { legend: { labels: { boxWidth: 12 } } },
+    },
+  });
+
+  // Heatmap as a CSS grid — Chart.js has no matrix type without a plugin, and
+  // the report must stay dependency-free beyond the single Chart.js script.
+  const DAYS = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+  const peak = Math.max(...K.heatmap.flat(), 1);
+  const heat = document.getElementById("heat");
+  let html = "<div></div>" + Array.from({ length: 24 }, (_, h) => "<div>" + (h % 3 === 0 ? h : "") + "</div>").join("");
+  K.heatmap.forEach((row, d) => {
+    html += "<div>" + DAYS[d] + "</div>";
+    row.forEach((v, h) => {
+      const a = v / peak;
+      html += '<div class="cell" style="background:rgba(201,127,255,' + (0.06 + a * 0.94).toFixed(3) +
+        ')" title="' + DAYS[d] + " " + h + ":00 — " + fmtTok(v) + ' tokens"></div>';
+    });
+  });
+  heat.innerHTML = html;
 }
 </script>
 </body>
